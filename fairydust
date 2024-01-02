@@ -11,7 +11,7 @@ ACCESS_KEY_CONFIG=~/.fairydust/config.json
 function printUsage() {
   cat << EOF
 Usage:
-  fairydust dns <domain> [IP address]      View existing DNS record or update DNS record for a domain
+  fairydust dns [domain] [IP address]      View existing DNS record or update DNS record for a domain
   fairydust cert <domain>                  Generate SSL certificate for a domain
   fairydust renew                          Try to renew all issued certificates
 EOF
@@ -57,6 +57,11 @@ COMMAND=$1
 configureAliyun
 
 if [[ $COMMAND == "dns" ]]; then
+  if [[ $# -eq 1 ]]; then
+    aliyun alidns DescribeDomainRecords --DomainName fairydust.cn --PageSize 200 | jq -r "[.DomainRecords.Record[] | select(.Type == \"A\") | pick(.RR, .Value) | .RR + \".${ROOT_DOMAIN} -> \" + .Value] | sort | .[]"
+    exit 0;
+  fi
+
   SUB_DOMAIN=$2
   RR=${SUB_DOMAIN%".${ROOT_DOMAIN}"}
 
@@ -71,8 +76,8 @@ if [[ $COMMAND == "dns" ]]; then
       aliyun alidns AddDomainRecord -q --DomainName "$ROOT_DOMAIN" --Type A --RR "$RR" --Value "$IP"
       echo "Added DNS record: $SUB_DOMAIN -> $IP"
     else
-      recordId=$(jq -r '.RecordId' <<< "$DNS_RECORD")
-      aliyun alidns UpdateDomainRecord -q --RecordId "$recordId" --Type A --RR "$RR" --Value "$IP"
+      RECORD_ID=$(jq -r '.RecordId' <<< "$DNS_RECORD")
+      aliyun alidns UpdateDomainRecord -q --RecordId "$RECORD_ID" --Type A --RR "$RR" --Value "$IP"
       echo "Updated DNS record: $SUB_DOMAIN -> $IP"
     fi
   else
@@ -88,6 +93,11 @@ if [[ $COMMAND == "dns" ]]; then
 fi
 
 if [[ $COMMAND == "cert" ]]; then
+  if [[ $# -eq 1 ]]; then
+    printUsage
+    exit 1;
+  fi
+
   SUB_DOMAIN=$2
 
   # Set up these directories for avoiding root privilege.
@@ -106,14 +116,14 @@ if [[ $COMMAND == "cert" ]]; then
     --logs-dir "$CERTBOT_LOGS_DIR" \
     --work-dir "$CERTBOT_WORK_DIR"
 
-  echo "If you'd like to use `chii`, the following command is ready for you."
+  echo "If you'd like to use \`chii\`, the following command is ready for you."
 
   cat << EOF
 chii start \\
   --https \\
-  --ssl-cert "~/.fairydust/config/live/${SUB_DOMAIN}/fullchain.pem" \\
-  --ssl-key "~/.fairydust/config/live/${SUB_DOMAIN}/privkey.pem" \\
-  --domain "${SUB_DOMAIN}" \\
+  --ssl-cert ~/.fairydust/config/live/${SUB_DOMAIN}/fullchain.pem \\
+  --ssl-key ~/.fairydust/config/live/${SUB_DOMAIN}/privkey.pem \\
+  --domain ${SUB_DOMAIN} \\
   --port 443
 EOF
 
@@ -129,10 +139,20 @@ if [[ $COMMAND == "auth" ]]; then
     A_RECORD=${SUB_DOMAIN%".${ROOT_DOMAIN}"}
     TXT_RR="_acme-challenge.$A_RECORD"
     TXT_DOMAIN="${TXT_RR}.${ROOT_DOMAIN}"
+    DNS_RECORD=$(
+      aliyun alidns DescribeSubDomainRecords --SubDomain "$TXT_DOMAIN" | jq '.DomainRecords.Record[] | select(.Type == "TXT")'
+    )
+
+    if [[ "$DNS_RECORD" == "" ]]; then
+      echo "Adding TXT Record for ACME challenge: ${TXT_DOMAIN} -> ${VALIDATION}"
+      aliyun alidns AddDomainRecord -q --DomainName "$ROOT_DOMAIN" --Type TXT --RR "$TXT_RR" --Value "$VALIDATION"
+    else
+      echo "Updating TXT Record for ACME challenge: ${TXT_DOMAIN} -> ${VALIDATION}"
+      RECORD_ID=$(jq -r '.RecordId' <<< "$DNS_RECORD")
+      aliyun alidns UpdateDomainRecord -q --RecordId "$RECORD_ID" --Type TXT --RR "$TXT_RR" --Value "$VALIDATION"
+    fi
     
-    echo "Adding TXT Record for ACME challenge: ${TXT_DOMAIN} -> ${VALIDATION}"
-    aliyun alidns AddDomainRecord -q --DomainName "$ROOT_DOMAIN" --Type TXT --RR "$TXT_RR" --Value "$VALIDATION"
-    echo "Added TXT Record: ${TXT_DOMAIN}"
+    echo "Waiting for the new DNS resolution"
 
     VALIDATION_RECORD_VALUE=""
     until [[ "$VALIDATION" == "$VALIDATION_RECORD_VALUE" ]]; do
@@ -142,7 +162,7 @@ if [[ $COMMAND == "auth" ]]; then
 
     exit 0
   else
-    echo "The commond should only be called by manual-auth-hook of `certbot`"
+    echo "The commond should only be called by manual-auth-hook of \`certbot\`"
     exit 1
   fi
 fi
