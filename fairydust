@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DOMAIN=fairydust.cn
+CERTBOT_CONFIG_DIR=~/.fairydust/config
+CERTBOT_LOGS_DIR=~/.fairydust/log
+CERTBOT_WORK_DIR=~/.fairydust/work
+ACCESS_KEY_CONFIG=~/.fairydust/config.json
+
+function printUsage() {
+  cat << EOF
+Usage:
+  fairydust dns <domain> [IP address]      View existing DNS record or update DNS record for a domain
+  fairydust cert <domain>                  Generate SSL certificate for a domain
+  fairydust renew                          Try to renew all issued certificates
+EOF
+  # fairydust auth                           Internal command for \`fairydust cert\`, don't use it
+}
+
+# https://www.alibabacloud.com/help/zh/alibaba-cloud-cli/latest/non-interactive-configuration#section-hhx-jpx-95g
+function configureAliyun() {
+  if [[ ! -f "$ACCESS_KEY_CONFIG" ]]; then
+    echo "Please add the config: ${ACCESS_KEY_CONFIG}. For example:"
+    cat << EOF    
+{
+  "accessKeyId": "",
+  "accessKeySecret": ""
+}
+EOF
+    exit 1
+  fi
+
+  ACCESS_KEY_ID=$(jq -r '.accessKeyId // ""' "$ACCESS_KEY_CONFIG")
+  ACCESS_KEY_SECRET=$(jq -r '.accessKeySecret // ""' "$ACCESS_KEY_CONFIG")
+
+  if [[ "$ACCESS_KEY_ID" != "" && "$ACCESS_KEY_SECRET" != "" ]]; then
+    aliyun configure set \
+      --profile akProfile \
+      --mode AK \
+      --region cn-hangzhou \
+      --access-key-id $ACCESS_KEY_ID \
+      --access-key-secret $ACCESS_KEY_SECRET
+  else
+    echo "The config(${ACCESS_KEY_CONFIG}) is not valid."
+    exit 1
+  fi
+}
+
+if [[ $# -lt 1 ]]; then
+  printUsage
+  exit 0
+fi
+
+COMMAND=$1
+
+configureAliyun
+
+if [[ $COMMAND == "dns" ]]; then
+  SUB_DOMAIN=$2
+  RR=${SUB_DOMAIN%".${ROOT_DOMAIN}"}
+
+  DNS_RECORD=$(
+    aliyun alidns DescribeSubDomainRecords --SubDomain "$SUB_DOMAIN" | jq '.DomainRecords.Record[] | select(.Type == "A")'
+  )
+
+  if [[ $# -ge 3 ]]; then
+    IP=$3
+
+    if [[ "$DNS_RECORD" == "" ]]; then
+      aliyun alidns AddDomainRecord -q --DomainName "$ROOT_DOMAIN" --Type A --RR "$RR" --Value "$IP"
+      echo "Added DNS record: $SUB_DOMAIN -> $IP"
+    else
+      recordId=$(jq -r '.RecordId' <<< "$DNS_RECORD")
+      aliyun alidns UpdateDomainRecord -q --RecordId "$recordId" --Type A --RR "$RR" --Value "$IP"
+      echo "Updated DNS record: $SUB_DOMAIN -> $IP"
+    fi
+  else
+    if [[ "$DNS_RECORD" == "" ]]; then
+      echo "No DNS record for $SUB_DOMAIN"
+    else
+      DNS_RECORD_VALUE=$(jq -r '.Value' <<< "$DNS_RECORD")
+      echo "Current DNS record is: $DNS_RECORD_VALUE"
+    fi
+  fi
+
+  exit 0
+fi
+
+if [[ $COMMAND == "cert" ]]; then
+  SUB_DOMAIN=$2
+
+  # Set up these directories for avoiding root privilege.
+  mkdir -p "$CERTBOT_CONFIG_DIR" "$CERTBOT_LOGS_DIR" "$CERTBOT_WORK_DIR"
+
+  # [Let's Encrypt](https://letsencrypt.org/getting-started/)
+  certbot certonly \
+    -d "$SUB_DOMAIN" \
+    --email minhui.zhao@thoughtworks.com \
+    --manual \
+    --agree-tos \
+    --no-eff-email \
+    --preferred-challenges dns \
+    --manual-auth-hook "$0 auth" \
+    --config-dir "$CERTBOT_CONFIG_DIR" \
+    --logs-dir "$CERTBOT_LOGS_DIR" \
+    --work-dir "$CERTBOT_WORK_DIR"
+
+  echo "If you'd like to use `chii`, the following command is ready for you."
+
+  cat << EOF
+chii start \\
+  --https \\
+  --ssl-cert "~/.fairydust/config/live/${SUB_DOMAIN}/fullchain.pem" \\
+  --ssl-key "~/.fairydust/config/live/${SUB_DOMAIN}/privkey.pem" \\
+  --domain "${SUB_DOMAIN}" \\
+  --port 443
+EOF
+
+  exit 0
+fi
+
+# https://eff-certbot.readthedocs.io/en/stable/using.html#pre-and-post-validation-hooks
+if [[ $COMMAND == "auth" ]]; then
+  SUB_DOMAIN=${CERTBOT_DOMAIN:-}
+  VALIDATION=${CERTBOT_VALIDATION:-}
+
+  if [[ -n "$SUB_DOMAIN" && -n "$VALIDATION" ]]; then
+    A_RECORD=${SUB_DOMAIN%".${ROOT_DOMAIN}"}
+    TXT_RR="_acme-challenge.$A_RECORD"
+    TXT_DOMAIN="${TXT_RR}.${ROOT_DOMAIN}"
+    
+    echo "Adding TXT Record for ACME challenge: ${TXT_DOMAIN} -> ${VALIDATION}"
+    aliyun alidns AddDomainRecord -q --DomainName "$ROOT_DOMAIN" --Type TXT --RR "$TXT_RR" --Value "$VALIDATION"
+    echo "Added TXT Record: ${TXT_DOMAIN}"
+
+    VALIDATION_RECORD_VALUE=""
+    until [[ "$VALIDATION" == "$VALIDATION_RECORD_VALUE" ]]; do
+      sleep 1
+      VALIDATION_RECORD_VALUE=$(dig +short -t txt "$TXT_DOMAIN" | tr -d '"')
+    done
+
+    exit 0
+  else
+    echo "The commond should only be called by manual-auth-hook of `certbot`"
+    exit 1
+  fi
+fi
+
+if [[ $COMMAND == "renew" ]]; then
+  # [Setting up automated renewal](https://eff-certbot.readthedocs.io/en/latest/using.html#setting-up-automated-renewal)
+  # SLEEPTIME=$(awk 'BEGIN{srand(); print int(rand()*(3600+1))}'); echo "0 0,12 * * * root sleep $SLEEPTIME && certbot renew -q" | sudo tee -a /etc/crontab > /dev/null
+
+  certbot renew \
+    --config-dir "$CERTBOT_CONFIG_DIR" \
+    --logs-dir "$CERTBOT_LOGS_DIR" \
+    --work-dir "$CERTBOT_WORK_DIR"
+
+  exit 0
+fi
+
+printUsage
+exit 0
